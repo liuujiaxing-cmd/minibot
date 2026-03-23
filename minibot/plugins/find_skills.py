@@ -52,4 +52,4 @@ def find_skills(query: str):
     if not results:
         return f"No skills found for '{query}'. Try broader terms like 'react', 'deploy', 'web'."
         
-    return "Found skills:\n" + "\n".join(results) + "\n\nTo install a remote skill, use `add_skill_from_git`."
+    return "Found skills:\n" + "\n".join(results) + "\n\nTo install a remote skill, use `add_skill_from_git` (supports documentation-only SKILL.md and executable skill packs via skillpack.json)."

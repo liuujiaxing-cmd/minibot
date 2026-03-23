@@ -36,7 +36,9 @@ Minibot 是一个基于插件的自主 AI 智能体，专为**持续学习**和*
 
 3.  **运行**:
     ```bash
-    python main.py
+    # 确保已激活虚拟环境
+    # source venv/bin/activate
+    python3 main.py
     ```
 
 ## 🧩 插件系统
@@ -54,6 +56,23 @@ Minibot 的核心力量源自 `minibot/plugins/` 目录。
 您可以直接命令 Minibot 安装技能：
 > “帮我找一个关于 React 最佳实践的技能。”
 > “安装 vercel-labs/agent-skills@react-best-practices。”
+
+Minibot 支持两类“可分享技能”：
+*   **文档型技能**：仅包含 `SKILL.md`，用于学习与提示词注入。
+*   **可执行技能包（Skill Pack）**：在仓库中提供 `skillpack.json` + 入口文件，Minibot 会自动安装为 **Python 插件** 或追加到 **skills.sh**。
+
+Skill Pack 推荐仓库结构：
+```
+skills/<skill_name>/
+├── skillpack.json
+├── SKILL.md
+└── <entry>   # python: <skill_name>.py  /  bash: skill.sh
+```
+
+常用操作：
+*   **安装（GitHub）**：`add_skill_from_git(repo='OWNER/REPO', skill_name='<skill_name>', ref='main')`
+*   **创建骨架**：`scaffold_skill_pack(name='<skill_name>', kind='python'|'bash', description='...')`
+*   **打包压缩**：`pack_skill_pack(skill_dir='.trae/skills_src/<skill_name>')`
 
 ## 🏗️ 架构设计
 
@@ -76,6 +95,7 @@ minibot/
 │   └── plugins/         # 🔌 技能插件 (Python 文件)
 │       ├── bash_skills.py    # Bash 桥接与技能安装器
 │       ├── find_skills.py    # 技能发现 (本地 + Vercel)
+│       ├── skill_packaging.py # 技能包创建/打包/本地安装
 │       ├── web_search.py     # 联网搜索
 │       └── ...
 └── requirements.txt     # 依赖列表

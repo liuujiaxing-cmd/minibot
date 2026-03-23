@@ -3,40 +3,131 @@ import requests
 import os
 import re
 import subprocess
+import json
 
-@tool(name="add_skill_from_git", description="Install a skill from a GitHub repository (like `npx skills add`). Usage: add_skill_from_git(repo='vercel-labs/agent-skills', skill_name='react-best-practices')")
-def add_skill_from_git(repo: str, skill_name: str):
-    """
-    Fetches the `SKILL.md` or relevant files from a GitHub repository.
-    Example: `vercel-labs/agent-skills` -> `skills/react-best-practices/SKILL.md`
-    """
-    
-    # Construct the raw GitHub URL for SKILL.md
-    # Assuming standard structure: https://raw.githubusercontent.com/<owner>/<repo>/main/skills/<skill_name>/SKILL.md
-    base_url = f"https://raw.githubusercontent.com/{repo}/main/skills/{skill_name}/SKILL.md"
-    
+def _safe_skill_name(skill_name: str) -> bool:
+    return bool(re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_\-]*$", skill_name or ""))
+
+def _safe_python_module_name(name: str) -> bool:
+    return bool(re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", name or ""))
+
+def _fetch_github_raw(repo: str, ref: str, path: str, timeout: int = 15) -> str | None:
+    url = f"https://raw.githubusercontent.com/{repo}/{ref}/{path}"
+    r = requests.get(url, timeout=timeout)
+    if r.status_code != 200:
+        return None
+    return r.text
+
+def _write_text_file(path: str, content: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+def _append_block_to_skills_sh(block: str, label: str) -> str:
+    block = (block or "").strip()
+    if not block:
+        return "Error: Empty skill content."
+
     try:
-        response = requests.get(base_url)
-        if response.status_code != 200:
-            # Try without the 'skills/' prefix if it fails
-            base_url = f"https://raw.githubusercontent.com/{repo}/main/{skill_name}/SKILL.md"
-            response = requests.get(base_url)
-            if response.status_code != 200:
-                return f"Failed to fetch skill '{skill_name}' from '{repo}'. Check the repository and skill name."
-        
-        skill_content = response.text
-        
-        # Save locally to .trae/skills/ or minibot/skills/
-        # Let's save it to a dedicated directory for downloaded skills
-        skills_dir = os.path.join(os.getcwd(), ".trae", "skills", skill_name)
-        os.makedirs(skills_dir, exist_ok=True)
-        
-        skill_file = os.path.join(skills_dir, "SKILL.md")
-        with open(skill_file, "w") as f:
-            f.write(skill_content)
-            
-        return f"✅ Skill '{skill_name}' installed successfully to {skill_file}. Minibot can now reference this skill."
-        
+        try:
+            with open("skills.sh", "r", encoding="utf-8") as f:
+                original_content = f.read()
+        except FileNotFoundError:
+            original_content = "#!/bin/bash\n"
+
+        temp_file = "skills.temp.sh"
+        with open(temp_file, "w", encoding="utf-8") as f:
+            f.write(original_content)
+            f.write("\n\n")
+            f.write(f"# Installed: {label}\n")
+            f.write(block)
+            f.write("\n")
+
+        check = subprocess.run(
+            ["bash", "-n", temp_file],
+            capture_output=True,
+            text=True
+        )
+        if check.returncode != 0:
+            os.remove(temp_file)
+            return f"Error: The downloaded skill has bash syntax errors and was NOT added.\nDetails: {check.stderr}"
+
+        os.rename(temp_file, "skills.sh")
+        return "ok"
+    except Exception as e:
+        return f"Error installing skill into skills.sh: {str(e)}"
+
+@tool(name="add_skill_from_git", description="Install a skill from a GitHub repository (like `npx skills add`). Supports both documentation-only skills and executable skill packs. Usage: add_skill_from_git(repo='vercel-labs/agent-skills', skill_name='react-best-practices', ref='main')")
+def add_skill_from_git(repo: str, skill_name: str, ref: str = "main"):
+    """
+    Fetches a skill from a GitHub repository.
+    If the repository provides a skill pack manifest (skillpack.json), Minibot installs the executable skill:
+    - type=bash: appends the entry file to skills.sh
+    - type=python: writes the entry file to minibot/plugins/ so it can be loaded on next restart
+    Otherwise, Minibot downloads SKILL.md for reference.
+    """
+
+    if not repo or "/" not in repo:
+        return "Error: Invalid repo format. Use 'owner/repo'."
+    if not _safe_skill_name(skill_name):
+        return "Error: Invalid skill_name. Use letters/numbers/_/- only."
+
+    skills_dir = os.path.join(os.getcwd(), ".trae", "skills", skill_name)
+    os.makedirs(skills_dir, exist_ok=True)
+
+    try:
+        manifest = _fetch_github_raw(repo, ref, f"skills/{skill_name}/skillpack.json")
+        manifest_root = _fetch_github_raw(repo, ref, f"{skill_name}/skillpack.json")
+
+        manifest_text = manifest or manifest_root
+        manifest_prefix = f"skills/{skill_name}" if manifest else f"{skill_name}" if manifest_root else None
+
+        skill_md = _fetch_github_raw(repo, ref, f"skills/{skill_name}/SKILL.md") or _fetch_github_raw(repo, ref, f"{skill_name}/SKILL.md")
+        if skill_md:
+            _write_text_file(os.path.join(skills_dir, "SKILL.md"), skill_md)
+
+        if not manifest_text:
+            if skill_md:
+                return f"✅ Skill '{skill_name}' installed successfully to {os.path.join(skills_dir, 'SKILL.md')}. Minibot can now reference this skill."
+            return f"Failed to fetch skill '{skill_name}' from '{repo}'. Check the repository and skill name."
+
+        try:
+            manifest_obj = json.loads(manifest_text)
+        except Exception as e:
+            return f"Error: skillpack.json is not valid JSON: {str(e)}"
+
+        pack_type = (manifest_obj.get("type") or "").strip().lower()
+        entry = (manifest_obj.get("entry") or "").strip()
+        pack_name = (manifest_obj.get("name") or skill_name).strip()
+
+        if not entry:
+            return "Error: skillpack.json missing 'entry'."
+        if pack_type not in {"bash", "python"}:
+            return "Error: skillpack.json 'type' must be 'bash' or 'python'."
+
+        entry_path = f"{manifest_prefix}/{entry}"
+        entry_text = _fetch_github_raw(repo, ref, entry_path)
+        if entry_text is None:
+            return f"Failed to fetch entry file '{entry}' from '{repo}' at ref '{ref}'."
+
+        _write_text_file(os.path.join(skills_dir, "skillpack.json"), manifest_text)
+        _write_text_file(os.path.join(skills_dir, os.path.basename(entry)), entry_text)
+
+        if pack_type == "bash":
+            r = _append_block_to_skills_sh(entry_text, f"{repo}@{ref}:{pack_name}")
+            if r != "ok":
+                return r
+            return f"✅ Installed bash skill '{pack_name}' into skills.sh and saved files under {skills_dir}."
+
+        if not _safe_python_module_name(pack_name):
+            return "Error: Python skill name must be a valid identifier (letters/numbers/_)."
+
+        plugins_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "plugins")
+        os.makedirs(plugins_dir, exist_ok=True)
+        plugin_path = os.path.join(plugins_dir, f"{pack_name}.py")
+        _write_text_file(plugin_path, entry_text)
+        return f"✅ Installed python skill '{pack_name}' to {plugin_path}. Restart Minibot to load it. Files saved under {skills_dir}."
+
     except Exception as e:
         return f"Error installing skill from git: {str(e)}"
 

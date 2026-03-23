@@ -2,22 +2,89 @@ import re
 import json
 import ast
 import asyncio
+import os
+import time
 from typing import List, Dict, Any
 from .llm import llm_client
 from .tools import get_tools_description, execute_tool, tools_registry, load_plugins
 from .memory.short_term import ShortTermMemory
 from .memory.long_term import LongTermMemory
 from .modules.safety import SafetyChecker
-from .modules.planner import Planner
+from .modules.planner import Planner, format_plan
 from .modules.personality import PersonalityManager
 from .modules.memory_manager import MemoryManager
-from .ui import ui  # Import UI
+from .modules.daily_journal import daily_journal
+from .memory.vector_memory import vector_memory
+from .modules.perf import PerfTracer, perf_include_in_response
+from .ui import ui
+
+
+def _is_chinese(text: str) -> bool:
+    for ch in text:
+        if "\u4e00" <= ch <= "\u9fff":
+            return True
+    return False
+
+
+def _truncate(value: object, limit: int = 120) -> str:
+    s = str(value)
+    if len(s) <= limit:
+        return s
+    return s[:limit] + "..."
+
+
+def _should_decompose(user_message: str) -> bool:
+    text = user_message.strip()
+    if not text:
+        return False
+
+    lower = text.lower()
+    if "\n" in text:
+        return True
+
+    if re.search(r"(^|\n)\s*\d+[\.\)]\s+", text):
+        return True
+
+    if len(text) >= 60:
+        return True
+
+    if len(re.findall(r"[。！？!?;；]", text)) >= 2:
+        return True
+
+    en_keys = [
+        "plan",
+        "step",
+        "steps",
+        "workflow",
+        "checklist",
+        "todo",
+        "break down",
+        "decompose",
+    ]
+    if any(k in lower for k in en_keys):
+        return True
+
+    zh_keys = ["计划", "步骤", "流程", "拆解", "分解", "依次", "分别"]
+    if any(k in text for k in zh_keys):
+        return True
+
+    connectors = ["然后", "接着", "之后", "同时", "并且", "先", "再", "最后", "另外"]
+    connector_hits = sum(text.count(k) for k in connectors)
+    if connector_hits >= 2:
+        return True
+
+    if "支持" in text:
+        if any(k in text for k in ["并", "以及", "同时"]):
+            return True
+        if len(re.findall(r"[、/,，,]", text)) >= 2:
+            return True
+
+    return False
 
 class Agent:
     """Core agent logic handling the ReAct loop."""
     
     def __init__(self, system_prompt: str = None):
-        # Initialize plugins dynamically
         load_plugins()
         ui.log_event("SYSTEM", "Plugins Loaded", "Ready to serve.")
         
@@ -28,108 +95,149 @@ class Agent:
         
         self.short_term_memory = ShortTermMemory(max_turns=10)
         self.long_term_memory = LongTermMemory(file_path="minibot_memory.json")
-        self.max_steps = 15  # Increased from 5 to allow for learning/installing/executing loops
+        self.max_steps = 50
         
-        # Base system prompt template
-        self.system_prompt_template = (
-            "You are Minibot, a helpful AI assistant. Always respond in the user's language.\n"
-            "{style_instruction}\n"
-            "You have access to the following tools:\n"
-            "{tools_desc}\n\n"
-            "Task Plan: {plan}\n\n"
-            "To use a tool, you MUST use the following format:\n"
-            "Thought: <your reasoning>\n"
-            "Action: <tool_name>\n"
-            "Action Input: <json_arguments>\n"
-            "Observation: <result of the tool>\n\n"
-            "Example:\n"
-            "Action: remember\n"
-            "Action Input: {{\"key\": \"birthday\", \"value\": \"2000-01-01\"}}\n\n"
-            "Important Rules:\n"
-            "1. ALWAYS check the current date using 'get_current_time' before calculating age or time durations.\n"
-            "2. If the user provides personal information (name, birthday, preferences), use the 'remember' tool to save it.\n"
-            "3. If you need to recall information, use the 'recall' tool.\n"
-            "4. If you have enough information to answer, just reply directly without using tools.\n"
-            "5. Do NOT use tools if not necessary.\n"
-            "6. Do NOT provide explanations about tools, just use them.\n"
-            "7. Output ONLY the 'Action' and 'Action Input' when using a tool.\n"
-            "8. Speak Chinese if the user speaks Chinese.\n"
-            "9. LEARNING PROTOCOL (CRITICAL):\n"
-            "   - NEVER refuse a request by saying you 'cannot' do something or that you lack knowledge.\n"
-            "   - If a task requires a skill you don't have (e.g., getting news, checking weather, controlling apps), you MUST:\n"
-            "     a. Discover: Action: find_skills(query='xxx')\n"
-            "     b. If found in Vercel Remote: Action: add_skill_from_git(repo='...', skill_name='...')\n"
-            "     c. If found in Local Remote: Action: install_skill(skill_name='xxx')\n"
-            "     d. Then Execute it: Action: execute_skill(skill_name='xxx')\n"
-            "   - If not found in any marketplace, use your internal knowledge to WRITE a bash function and use 'add_skill' to save it.\n"
-            "   - BE AUTONOMOUS. Do not ask for permission to learn. Just do it."
-        )
+        soul_path = os.path.join(os.path.dirname(__file__), "soul.txt")
+        if os.path.exists(soul_path):
+            with open(soul_path, "r", encoding="utf-8") as f:
+                self.system_prompt_template = f.read()
+        else:
+            self.system_prompt_template = (
+                "You are Minibot, a helpful AI assistant. Always respond in the user's language.\n"
+                "{style_instruction}\n"
+                "You have access to the following tools:\n"
+                "{tools_desc}\n\n"
+                "Task Plan: {plan}\n\n"
+                "To use a tool, you MUST use the following format:\n"
+                "Thought: <your reasoning>\n"
+                "Action: <tool_name>\n"
+                "Action Input: <json_arguments>\n"
+                "Observation: <result of the tool>\n\n"
+                "Example:\n"
+                "Action: remember\n"
+                "Action Input: {{\"key\": \"birthday\", \"value\": \"2000-01-01\"}}\n\n"
+                "Important Rules:\n"
+                "1. ALWAYS check the current date using 'get_current_time' before calculating age or time durations.\n"
+                "2. If the user provides personal information (name, birthday, preferences), use the 'remember' tool to save it.\n"
+                "3. If you need to recall information, use the 'recall' tool.\n"
+                "4. If you have enough information to answer, just reply directly without using tools.\n"
+                "5. Do NOT use tools if not necessary.\n"
+                "6. Do NOT provide explanations about tools, just use them.\n"
+                "7. Output ONLY the 'Action' and 'Action Input' when using a tool.\n"
+                "8. Speak Chinese if the user speaks Chinese.\n"
+                "9. LEARNING PROTOCOL (CRITICAL):\n"
+                "   - NEVER refuse a request by saying you 'cannot' do something or that you lack knowledge.\n"
+                "   - If a task requires a skill you don't have (e.g., getting news, checking weather, controlling apps), you MUST:\n"
+                "     a. Discover: Action: find_skills(query='xxx')\n"
+                "     b. If found in Vercel Remote: Action: add_skill_from_git(repo='...', skill_name='...')\n"
+                "     c. If found in Local Remote: Action: install_skill(skill_name='xxx')\n"
+                "     d. Then Execute it: Action: execute_skill(skill_name='xxx')\n"
+                "   - If not found in any marketplace, use your internal knowledge to WRITE a bash function and use 'add_skill' to save it.\n"
+                "   - BE AUTONOMOUS. Do not ask for permission to learn. Just do it."
+            )
 
     async def process_message(self, user_message: str) -> str:
         """Process a user message through the full cognitive pipeline."""
+        perf = PerfTracer()
+        t0 = time.perf_counter()
         
-        # 1. Safety Check (Input)
-        if not self.safety.check_input(user_message):
+        ts = time.perf_counter()
+        safe_ok = self.safety.check_input(user_message)
+        perf.mark("safety_check_input", (time.perf_counter() - ts) * 1000.0)
+        if not safe_ok:
             ui.log_event("SAFETY", "Input Blocked", "Dangerous command detected.")
             return "I cannot process this request due to safety restrictions."
 
-        # 2. Add to Short-Term Memory
+        ts = time.perf_counter()
         self.short_term_memory.add("user", user_message)
+        perf.mark("stm_add_user", (time.perf_counter() - ts) * 1000.0)
+
+        ts = time.perf_counter()
+        try:
+            if daily_journal:
+                daily_journal.append_turn("用户", user_message)
+        except Exception:
+            pass
+        perf.mark("daily_journal_append_user", (time.perf_counter() - ts) * 1000.0)
+
+        ts = time.perf_counter()
+        try:
+            if vector_memory:
+                asyncio.create_task(vector_memory.add("user", user_message, {"type": "turn"}))
+        except Exception:
+            pass
+        perf.mark("vector_add_user_scheduled", (time.perf_counter() - ts) * 1000.0)
         
-        # 3. Retrieve Context (LTM & STM)
         ui.log_event("MEMORY", "Context Retrieved", "Loading STM & LTM...")
+        ts = time.perf_counter()
         ltm_context = self.long_term_memory.get_context()
+        perf.mark("ltm_get_context", (time.perf_counter() - ts) * 1000.0)
+        vector_context = []
+        try:
+            if vector_memory:
+                ts = time.perf_counter()
+                vector_context = await vector_memory.get_context(user_message, top_k=5)
+                perf.mark("vector_get_context", (time.perf_counter() - ts) * 1000.0)
+        except Exception:
+            vector_context = []
+        ts = time.perf_counter()
         stm_context = self.short_term_memory.get_context()
+        perf.mark("stm_get_context", (time.perf_counter() - ts) * 1000.0)
         
-        # Extract user profile from LTM for personalization
-        # Simple extraction: look for 'user_name' key in memory
         user_name = self.long_term_memory.get("user_name")
         user_profile = {"user_name": user_name} if user_name else {}
         
-        # 4. Personality & Style Analysis
         style_instruction = self.personality.get_style_prompt(user_profile)
         
-        # 5. Planning (Task Decomposition)
-        # Only decompose if the input is complex (naive heuristic: long input or keywords)
         plan = "Standard Execution"
-        if len(user_message) > 20 or "plan" in user_message.lower() or "step" in user_message.lower():
+        decomposed_plan = None
+        structured_plan = None
+        if _should_decompose(user_message):
              ui.log_event("PLAN", "Decomposing Task", "Generating step-by-step plan...")
-             decomposed_plan = await self.planner.decompose(user_message)
-             if decomposed_plan != "SIMPLE":
-                 plan = f"Follow these steps:\n{decomposed_plan}"
-                 ui.log_event("PLAN", "Plan Created", decomposed_plan[:50] + "...")
+             ts = time.perf_counter()
+             sp = await self.planner.decompose_structured(user_message)
+             perf.mark("planner_decompose_structured", (time.perf_counter() - ts) * 1000.0)
+             if sp and not sp.get("simple", False):
+                 structured_plan = sp
+                 decomposed_plan = format_plan(sp)
+                 if decomposed_plan:
+                     plan = f"Follow these steps:\n{decomposed_plan}"
+                     ui.log_event("PLAN", "Plan Created", decomposed_plan[:50] + "...")
         
-        # 6. Prompt Engineering (Construct System Prompt)
+        ts = time.perf_counter()
         tools_desc = get_tools_description()
         current_system_prompt = self.system_prompt_template.format(
             style_instruction=style_instruction,
             tools_desc=tools_desc,
             plan=plan
         )
+        perf.mark("prompt_build", (time.perf_counter() - ts) * 1000.0)
         
-        # Build message chain
         messages = [{"role": "system", "content": current_system_prompt}]
         messages.extend(ltm_context)
+        messages.extend(vector_context)
         messages.extend(stm_context)
         
-        # 7. ReAct Loop (Select Tool -> Execute -> Observe)
         step = 0
         final_response = ""
         current_turn_messages = list(messages)
+        executed_steps = []
+        failures = []
+        replan_count = 0
         
         while step < self.max_steps:
-            # Call LLM
             ui.log_event("LLM", f"Step {step+1}", "Thinking...")
+            ts = time.perf_counter()
             response_text = await llm_client.chat(current_turn_messages)
+            perf.mark("llm_chat", (time.perf_counter() - ts) * 1000.0, {"step": step + 1})
+            perf.incr("llm_calls", 1)
             
-            # Check for tool usage
             tool_match = re.search(r"Action:\s*(\w+)\s*Action Input:\s*(.*?)(?:\nObservation:|$)", response_text, re.DOTALL)
             
             if tool_match:
                 tool_name = tool_match.group(1).strip()
                 tool_args_str = tool_match.group(2).strip()
                 
-                # Parse arguments
                 try:
                     try:
                         tool_args = json.loads(tool_args_str)
@@ -143,22 +251,55 @@ class Agent:
                         
                     ui.log_event("TOOL", f"Executing {tool_name}", str(tool_args))
                     
-                    # Execute tool
+                    ts = time.perf_counter()
                     if isinstance(tool_args, dict):
                         observation = execute_tool(tool_name, **tool_args)
                     else:
                          observation = execute_tool(tool_name, tool_args)
+                    tool_ms = (time.perf_counter() - ts) * 1000.0
+                    perf.mark("tool_exec", tool_ms, {"tool": tool_name})
+                    perf.incr("tool_calls", 1)
                     
-                    # Truncate observation for UI logs (full observation goes to LLM)
                     obs_preview = str(observation)[:100] + "..." if len(str(observation)) > 100 else str(observation)
                     ui.log_event("TOOL", "Observation", obs_preview)
+                    executed_steps.append(
+                        {
+                            "tool": tool_name,
+                            "args": _truncate(tool_args, 120),
+                            "observation": _truncate(observation, 160),
+                        }
+                    )
+                    obs_lower = str(observation).lower()
+                    if any(k in obs_lower for k in ["error", "failed", "timed out", "timeout"]):
+                        failures.append(f"{tool_name}: {_truncate(observation, 180)}")
+                        perf.incr("tool_failures", 1)
+                    if structured_plan and len(failures) >= 3 and replan_count < 1:
+                        replan_count += 1
+                        ui.log_event("PLAN", "Replanning", _truncate("\n".join(failures[-3:]), 160))
+                        ts = time.perf_counter()
+                        sp2 = await self.planner.decompose_structured(
+                            user_message + "\n\nKnown failures:\n" + "\n".join(failures[-5:])
+                        )
+                        perf.mark("planner_replan_structured", (time.perf_counter() - ts) * 1000.0)
+                        if sp2 and not sp2.get("simple", False):
+                            structured_plan = sp2
+                            decomposed_plan = format_plan(sp2)
+                            if decomposed_plan:
+                                plan = f"Follow these steps:\n{decomposed_plan}"
+                                current_system_prompt = self.system_prompt_template.format(
+                                    style_instruction=style_instruction,
+                                    tools_desc=tools_desc,
+                                    plan=plan,
+                                )
+                                current_turn_messages[0]["content"] = current_system_prompt
+                                failures = []
 
                 except Exception as e:
                     observation = f"Error parsing/executing tool: {str(e)}"
                     ui.log_event("ERROR", "Tool Execution Failed", str(e))
                 
-                # Update loop context
                 current_turn_messages.append({"role": "assistant", "content": response_text})
+                
                 current_turn_messages.append({"role": "user", "content": f"Observation: {observation}"})
                 step += 1
             else:
@@ -169,18 +310,105 @@ class Agent:
         if not final_response:
              final_response = "I apologize, but I ran out of steps to complete your request."
         
-        # 8. Safety Check (Output)
+        use_zh = _is_chinese(user_message)
         final_response = self.safety.sanitize_output(final_response)
+        core_response = final_response
+
+        plan_prefix = ""
+        if decomposed_plan:
+            if use_zh:
+                plan_prefix = "任务分解（自动生成）：\n" + decomposed_plan.strip()
+            else:
+                plan_prefix = "Task Breakdown (Auto):\n" + decomposed_plan.strip()
+
+        header = "我刚才做了这些：" if use_zh else "Here is what I did:"
+        lines = [header]
+        idx = 1
+        if plan and plan != "Standard Execution":
+            if use_zh:
+                lines.append(f"{idx}. 生成并采用任务计划：{_truncate(plan, 200)}")
+            else:
+                lines.append(f"{idx}. Created and followed a task plan: {_truncate(plan, 200)}")
+            idx += 1
+
+        if executed_steps:
+            for item in executed_steps:
+                if use_zh:
+                    lines.append(
+                        f"{idx}. 调用 `{item['tool']}`，参数：{item['args']}，结果：{item['observation']}"
+                    )
+                else:
+                    lines.append(
+                        f"{idx}. Called `{item['tool']}` with args: {item['args']}; result: {item['observation']}"
+                    )
+                idx += 1
+        else:
+            if use_zh:
+                lines.append(f"{idx}. 直接分析并给出答复（未调用工具）")
+            else:
+                lines.append(f"{idx}. Answered directly (no tool calls)")
+
+        perf.mark("total_turn", (time.perf_counter() - t0) * 1000.0, {"steps": step, "replans": replan_count})
+        summary = perf.summary()
+        if summary.get("enabled"):
+            top = summary.get("top_spans") or []
+            top_text = ", ".join([f"{t.get('name')}={t.get('ms')}ms" for t in top[:5]])
+            ui.log_event("PERF", f"total={summary.get('total_ms')}ms", top_text)
+            try:
+                path = perf.persist(
+                    {
+                        "ts": summary.get("ts"),
+                        "message_len": len(user_message),
+                        "steps": step,
+                        "replans": replan_count,
+                    }
+                )
+                if path:
+                    ui.log_event("PERF", "logged", path)
+            except Exception:
+                pass
+
+        perf_prefix = ""
+        if summary.get("enabled") and perf_include_in_response():
+            if use_zh:
+                perf_prefix = f"性能统计：总耗时 {summary.get('total_ms')}ms，LLM 调用 {summary.get('counts', {}).get('llm_calls', 0)} 次，工具调用 {summary.get('counts', {}).get('tool_calls', 0)} 次"
+            else:
+                perf_prefix = f"Performance: total {summary.get('total_ms')}ms, LLM calls {summary.get('counts', {}).get('llm_calls', 0)}, tool calls {summary.get('counts', {}).get('tool_calls', 0)}"
+
+        prefix_parts = ["\n".join(lines)]
+        if perf_prefix:
+            prefix_parts.append(perf_prefix)
+        if plan_prefix:
+            prefix_parts.append(plan_prefix)
+        final_response = "\n\n".join(prefix_parts) + "\n\n" + core_response
         
-        # 9. Automatic Memory Extraction (Background Task)
-        # In a real app, this should be a background task (asyncio.create_task)
-        # to avoid delaying the response.
-        # But for simplicity, we'll run it here or in parallel.
-        # However, calling LLM again might slow down the interaction significantly if not parallel.
-        # Let's use asyncio.create_task to fire and forget.
         asyncio.create_task(self.memory_manager.auto_extract(user_message, final_response))
+
+        try:
+            if daily_journal:
+                daily_journal.append_turn("Minibot", final_response)
+        except Exception:
+            pass
+
+        try:
+            if vector_memory:
+                core = final_response
+                if core.startswith("我刚才做了这些：") or core.startswith("Here is what I did:"):
+                    parts = core.split("\n\n", 1)
+                    if len(parts) == 2:
+                        core = parts[1]
+                if core.startswith("性能统计：") or core.startswith("Performance:"):
+                    parts = core.split("\n\n", 1)
+                    if len(parts) == 2:
+                        core = parts[1]
+                if core.startswith("任务分解（自动生成）：") or core.startswith("Task Breakdown (Auto):"):
+                    parts = core.split("\n\n", 1)
+                    if len(parts) == 2:
+                        core = parts[1]
+                asyncio.create_task(vector_memory.add("assistant", core, {"type": "turn"}))
+        except Exception:
+            pass
         
         return final_response
 
-# Singleton instance for simple usage
 agent = Agent()

@@ -8,3 +8,7 @@ minibot_memory.json
 minibot.log
 skills.temp.sh
 .trae/
+minibot_logs/
+minibot_memory/
+*.jsonl
+todo_data.json

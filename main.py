@@ -2,6 +2,8 @@ import asyncio
 import sys
 import os
 
+from apscheduler.triggers.cron import CronTrigger
+
 # Ensure the minibot package is in the path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -10,6 +12,7 @@ from minibot.config import config
 from minibot.connectors.console import ConsoleConnector
 from minibot.connectors.telegram import TelegramConnector
 from minibot.modules.scheduler import scheduler
+from minibot.modules.daily_journal import daily_journal
 
 async def main():
     """Main entry point for Minibot."""
@@ -17,6 +20,16 @@ async def main():
     
     # Start the scheduler
     scheduler.start()
+
+    if daily_journal:
+        asyncio.create_task(daily_journal.finalize_overdue())
+        scheduler.scheduler.add_job(
+            daily_journal.finalize_previous_day,
+            CronTrigger(hour=0, minute=5),
+            id="daily_finalize",
+            name="daily_finalize",
+            replace_existing=True,
+        )
     
     tasks = []
     

@@ -9,18 +9,15 @@ class ConsoleConnector(BaseConnector):
     
     async def start(self):
         ui.display_welcome()
-        print("\nType 'exit' or 'quit' to stop.\n")
+        ui.console.print("\nType 'exit' or 'quit' to stop.\n", style="bold bright_white")
         
         while True:
             try:
-                # Use Rich's prompt (simulated)
-                # Note: Prompt.ask handles basic input. 
-                # For async input handling in a real loop, we might need a separate thread or just use input()
-                # To keep it simple and compatible with existing structure:
-                user_input = input("\n👤 You: ")
+                # Use Rich's prompt via UI system for consistent styling
+                user_input = ui.get_user_input()
                 
                 if user_input.lower() in ["exit", "quit"]:
-                    print("Goodbye!")
+                    ui.console.print("Goodbye!", style="bold bright_white")
                     break
                 
                 if not user_input.strip():
@@ -36,11 +33,11 @@ class ConsoleConnector(BaseConnector):
                 ui.stop_thinking()
                 
                 # Display response
-                print(f"\n🤖 Minibot: {response}")
+                ui.display_assistant_response(response)
                 
             except KeyboardInterrupt:
-                print("\nGoodbye!")
+                ui.console.print("\nGoodbye!", style="bold bright_white")
                 break
             except Exception as e:
                 ui.stop_thinking()
-                print(f"Error: {e}")
+                ui.log_event("ERROR", str(e))

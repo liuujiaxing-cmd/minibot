@@ -36,7 +36,7 @@ Minibot is an autonomous, plugin-based AI agent designed for **continuous learni
 
 3.  **Run**:
     ```bash
-    python main.py
+    python3 main.py
     ```
 
 ## 🧩 Plugin System
@@ -54,6 +54,10 @@ Minibot's power lies in its `minibot/plugins/` directory.
 You can ask Minibot to install skills for you:
 > "Find a skill for React best practices."
 > "Install vercel-labs/agent-skills@react-best-practices."
+
+Minibot supports two shareable skill types:
+*   **Documentation skills**: `SKILL.md` only (learning/prompt reference).
+*   **Executable Skill Packs**: `skillpack.json` + entry file. Minibot installs them as Python plugins or appends them into `skills.sh`.
 
 ## 🏗️ Architecture
 
@@ -76,6 +80,7 @@ minibot/
 │   └── plugins/         # 🔌 Skill Plugins (Python files)
 │       ├── bash_skills.py    # Bash bridge & skill installer
 │       ├── find_skills.py    # Skill discovery (Local + Vercel)
+│       ├── skill_packaging.py # Skill Pack scaffold/pack/install
 │       ├── web_search.py     # Internet access
 │       └── ...
 └── requirements.txt     # Dependencies
