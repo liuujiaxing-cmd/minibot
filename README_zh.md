@@ -14,12 +14,15 @@ Minibot 是一个基于插件的自主 AI 智能体，专为**持续学习**和*
 *   **💻 Bash 自主性**: 能够编写并执行 Bash 脚本 (`skills.sh`) 来操控您的操作系统 (macOS/Linux)。
 *   **🎨 极客风终端 UI**: 拥有精美的命令行界面，实时展示思考过程和日志。
 *   **⏰ Cron 定时任务**: “每天早上 8 点提醒我看新闻。”
+*   **🗓️ 每日对话日志**: 自动把每天的对话保存为 Markdown，并在日终归档压缩。
+*   **🧠 混合记忆**: 长期记忆（键值）+ 向量记忆检索（可选）。
+*   **⏱️ 性能追踪**: 记录各阶段耗时到 JSONL，便于定位“卡在哪”。
 
 ## 🚀 快速开始
 
 1.  **克隆与安装**:
     ```bash
-    git clone https://github.com/yourusername/minibot.git
+    git clone https://github.com/liuujiaxing-cmd/minibot.git
     cd minibot
     python3 -m venv venv
     source venv/bin/activate
@@ -40,6 +43,15 @@ Minibot 是一个基于插件的自主 AI 智能体，专为**持续学习**和*
     # source venv/bin/activate
     python3 main.py
     ```
+
+## ⚙️ 配置说明
+
+Minibot 会从 `.env` 读取环境变量：
+
+*   **LLM**：`LLM_PROVIDER`（`openai`/`ollama`/`deepseek`）、`DEFAULT_MODEL`
+*   **每日日志**：`DAILY_LOG_DIR`、`DAILY_ARCHIVE_DIR`
+*   **向量记忆**：`VECTOR_MEMORY_ENABLED`（`0`/`1`）、`VECTOR_EMBEDDING_PROVIDER`（`hash`/`openai`）、`VECTOR_MEMORY_PATH`
+*   **性能追踪**：`PERF_ENABLED`（`0`/`1`）、`PERF_LOG_DIR`、`PERF_INCLUDE_IN_RESPONSE`（`0`/`1`）
 
 ## 🧩 插件系统
 

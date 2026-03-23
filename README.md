@@ -14,12 +14,15 @@ Minibot is an autonomous, plugin-based AI agent designed for **continuous learni
 *   **💻 Bash Autonomy**: Can write its own Bash scripts (`skills.sh`) to control your OS (macOS/Linux).
 *   **🎨 Rich TUI**: A beautiful, hacker-style terminal interface with real-time thinking logs.
 *   **⏰ Cron Scheduling**: "Remind me to check news every morning at 8."
+*   **🗓️ Daily Journal**: Automatically saves each day's conversations to Markdown and archives them.
+*   **🧠 Hybrid Memory**: Long-term key-value memory + vector memory retrieval (optional).
+*   **⏱️ Performance Tracing**: JSONL perf logs with stage timings for profiling.
 
 ## 🚀 Quick Start
 
 1.  **Clone & Install**:
     ```bash
-    git clone https://github.com/yourusername/minibot.git
+    git clone https://github.com/liuujiaxing-cmd/minibot.git
     cd minibot
     python3 -m venv venv
     source venv/bin/activate
@@ -38,6 +41,15 @@ Minibot is an autonomous, plugin-based AI agent designed for **continuous learni
     ```bash
     python3 main.py
     ```
+
+## ⚙️ Configuration
+
+Minibot reads environment variables from `.env`:
+
+*   **LLM**: `LLM_PROVIDER` (`openai`/`ollama`/`deepseek`), `DEFAULT_MODEL`
+*   **Daily Journal**: `DAILY_LOG_DIR`, `DAILY_ARCHIVE_DIR`
+*   **Vector Memory**: `VECTOR_MEMORY_ENABLED` (`0`/`1`), `VECTOR_EMBEDDING_PROVIDER` (`hash`/`openai`), `VECTOR_MEMORY_PATH`
+*   **Perf**: `PERF_ENABLED` (`0`/`1`), `PERF_LOG_DIR`, `PERF_INCLUDE_IN_RESPONSE` (`0`/`1`)
 
 ## 🧩 Plugin System
 
@@ -58,6 +70,14 @@ You can ask Minibot to install skills for you:
 Minibot supports two shareable skill types:
 *   **Documentation skills**: `SKILL.md` only (learning/prompt reference).
 *   **Executable Skill Packs**: `skillpack.json` + entry file. Minibot installs them as Python plugins or appends them into `skills.sh`.
+
+Recommended Skill Pack layout:
+```
+skills/<skill_name>/
+├── skillpack.json
+├── SKILL.md
+└── <entry>   # python: <skill_name>.py  /  bash: skill.sh
+```
 
 ## 🏗️ Architecture
 
