@@ -32,6 +32,59 @@ def _truncate(value: object, limit: int = 120) -> str:
         return s
     return s[:limit] + "..."
 
+def _looks_like_failure(text: object) -> bool:
+    s = str(text).lower()
+    return any(k in s for k in ["error", "failed", "timed out", "timeout", "not found", "exception", "traceback"])
+
+
+def _extract_paths(text: object) -> List[str]:
+    s = str(text)
+    paths: List[str] = []
+    for m in re.findall(r"(~/[^\s'\"`]+|/Users/[^\s'\"`]+)", s):
+        paths.append(m)
+    seen = set()
+    out: List[str] = []
+    for p in paths:
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
+
+
+def _verify_existing_paths(paths: List[str]) -> List[str]:
+    verified: List[str] = []
+    for p in paths:
+        try:
+            expanded = os.path.expanduser(p)
+            if os.path.exists(expanded):
+                verified.append(p)
+        except Exception:
+            continue
+    return verified
+
+
+def _needs_audit_disclaimer(core_response: str, executed_steps: List[Dict[str, Any]]) -> bool:
+    if executed_steps:
+        return False
+    s = core_response or ""
+    if not s:
+        return False
+    if not re.search(r"(/Users/|~/)", s) and not any(k in s for k in ["文件", "文件夹", "目录", "脚本"]):
+        return False
+    return bool(re.search(r"(已|已经)\s*(创建|生成|写入|保存|上传|部署|完成)", s))
+
+
+def _needs_failure_disclaimer(core_response: str, failures: List[str]) -> bool:
+    if not failures:
+        return False
+    s = core_response or ""
+    if not s:
+        return False
+    if re.search(r"(全部|已经|已)\s*(完成|成功|创建|生成|保存|部署|上传)", s) or "✅" in s:
+        return True
+    return False
+
 
 def _should_decompose(user_message: str) -> bool:
     text = user_message.strip()
@@ -262,15 +315,28 @@ class Agent:
                     
                     obs_preview = str(observation)[:100] + "..." if len(str(observation)) > 100 else str(observation)
                     ui.log_event("TOOL", "Observation", obs_preview)
+                    ok = not _looks_like_failure(observation)
+                    evidence_paths: List[str] = []
+                    try:
+                        if isinstance(tool_args, dict):
+                            for key in ["path", "file_path", "dir", "directory", "output", "out_path", "target_path"]:
+                                v = tool_args.get(key)
+                                if isinstance(v, str) and v:
+                                    evidence_paths.extend(_extract_paths(v))
+                        evidence_paths.extend(_extract_paths(observation))
+                    except Exception:
+                        evidence_paths = []
+                    verified_paths = _verify_existing_paths(evidence_paths)
                     executed_steps.append(
                         {
                             "tool": tool_name,
                             "args": _truncate(tool_args, 120),
                             "observation": _truncate(observation, 160),
+                            "ok": ok,
+                            "verified_paths": verified_paths[:6],
                         }
                     )
-                    obs_lower = str(observation).lower()
-                    if any(k in obs_lower for k in ["error", "failed", "timed out", "timeout"]):
+                    if not ok:
                         failures.append(f"{tool_name}: {_truncate(observation, 180)}")
                         perf.incr("tool_failures", 1)
                     if structured_plan and len(failures) >= 3 and replan_count < 1:
@@ -313,6 +379,16 @@ class Agent:
         use_zh = _is_chinese(user_message)
         final_response = self.safety.sanitize_output(final_response)
         core_response = final_response
+        if _needs_audit_disclaimer(core_response, executed_steps):
+            if use_zh:
+                core_response = "注意：我在这轮对话里没有执行任何工具/命令，也没有对文件系统做修改；下面内容是建议或计划，并非已落地结果。\n\n" + core_response
+            else:
+                core_response = "Note: I did not execute any tools/commands or modify the filesystem in this turn; the content below is advice/plan, not a completed result.\n\n" + core_response
+        elif _needs_failure_disclaimer(core_response, failures):
+            if use_zh:
+                core_response = "注意：本轮执行中存在失败或未完成的步骤；下面若出现“已完成/已创建/已成功”等表述，请以“工具执行记录”里的实际观察结果为准。\n\n" + core_response
+            else:
+                core_response = "Note: There were failed or incomplete steps in this turn; if the text below claims completion, trust the tool execution record and observations instead.\n\n" + core_response
 
         plan_prefix = ""
         if decomposed_plan:
@@ -333,20 +409,25 @@ class Agent:
 
         if executed_steps:
             for item in executed_steps:
+                status = "成功" if item.get("ok") else "失败/未完成"
+                verified = item.get("verified_paths") or []
+                verified_text = ""
+                if verified:
+                    verified_text = "，已确认存在：" + ", ".join(verified) if use_zh else "; verified exists: " + ", ".join(verified)
                 if use_zh:
                     lines.append(
-                        f"{idx}. 调用 `{item['tool']}`，参数：{item['args']}，结果：{item['observation']}"
+                        f"{idx}. 调用 `{item['tool']}`（{status}），参数：{item['args']}，结果：{item['observation']}{verified_text}"
                     )
                 else:
                     lines.append(
-                        f"{idx}. Called `{item['tool']}` with args: {item['args']}; result: {item['observation']}"
+                        f"{idx}. Called `{item['tool']}` ({'ok' if item.get('ok') else 'failed'}), args: {item['args']}; result: {item['observation']}{verified_text}"
                     )
                 idx += 1
         else:
             if use_zh:
-                lines.append(f"{idx}. 直接分析并给出答复（未调用工具）")
+                lines.append(f"{idx}. 直接分析并给出答复（未调用工具，也未对文件系统做修改）")
             else:
-                lines.append(f"{idx}. Answered directly (no tool calls)")
+                lines.append(f"{idx}. Answered directly (no tool calls; no filesystem changes)")
 
         perf.mark("total_turn", (time.perf_counter() - t0) * 1000.0, {"steps": step, "replans": replan_count})
         summary = perf.summary()
