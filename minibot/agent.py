@@ -234,7 +234,10 @@ class Agent:
 
     def _save_checkpoint(self, task_id: str, payload: Dict[str, Any]) -> None:
         try:
-            save_checkpoint(task_id, payload)
+            base = load_checkpoint(task_id) or {}
+            merged = dict(base)
+            merged.update(payload or {})
+            save_checkpoint(task_id, merged)
         except Exception:
             pass
 
@@ -290,6 +293,156 @@ class Agent:
             perf.mark("parallel_agents", (time.perf_counter() - ts) * 1000.0)
             return {}
 
+    def _tools_desc_filtered(self, allowed_tools: set[str]) -> str:
+        desc = []
+        for tool_name, tool_data in tools_registry.items():
+            if tool_name not in allowed_tools:
+                continue
+            desc.append(f"- {tool_name}: {tool_data.get('description')}")
+        return "\n".join(desc) if desc else "No tools available."
+
+    async def _run_worker_subtask(
+        self,
+        subtask: Dict[str, Any],
+        base_context: List[Dict[str, str]],
+        use_zh: bool,
+        allowed_tools: set[str],
+        perf: PerfTracer,
+        task_id: str | None,
+    ) -> Dict[str, Any]:
+        title = str(subtask.get("title") or "").strip()
+        details = str(subtask.get("details") or "").strip()
+        success = str(subtask.get("success") or "").strip()
+        step_id = subtask.get("id")
+        prompt = (
+            f"Subtask:\n- id: {step_id}\n- title: {title}\n- details: {details}\n- success: {success}\n"
+        ).strip()
+        if use_zh:
+            prompt = (
+                f"子任务：\n- id: {step_id}\n- 标题: {title}\n- 细节: {details}\n- 验收: {success}\n"
+            ).strip()
+
+        style_instruction = self.personality.get_style_prompt({})
+        tools_desc = self._tools_desc_filtered(allowed_tools)
+        worker_system = (
+            "You are Minibot Worker. You must focus ONLY on the given subtask.\n"
+            "You may ONLY use the tools listed below.\n"
+            "If you cannot complete, explain what is missing and stop.\n\n"
+            f"{style_instruction}\n"
+            "Tools:\n"
+            f"{tools_desc}\n\n"
+            "Use tool format:\n"
+            "Thought: ...\n"
+            "Action: <tool_name>\n"
+            "Action Input: <json>\n"
+        )
+        if use_zh:
+            worker_system = (
+                "你是 Minibot Worker。你必须只关注给定子任务。\n"
+                "你只能使用下面列出的工具。\n"
+                "如果无法完成，请说明缺少什么并停止。\n\n"
+                f"{style_instruction}\n"
+                "可用工具：\n"
+                f"{tools_desc}\n\n"
+                "使用工具格式：\n"
+                "Thought: ...\n"
+                "Action: <tool_name>\n"
+                "Action Input: <json>\n"
+            )
+
+        current_turn_messages = [{"role": "system", "content": worker_system}]
+        current_turn_messages.extend(base_context)
+        current_turn_messages.append({"role": "user", "content": prompt})
+        executed_steps: List[Dict[str, Any]] = []
+        failures: List[str] = []
+        result = await self._react_loop(
+            current_turn_messages=current_turn_messages,
+            user_message=prompt,
+            style_instruction=style_instruction,
+            tools_desc=tools_desc,
+            plan="Worker Execution",
+            structured_plan=None,
+            decomposed_plan=None,
+            executed_steps=executed_steps,
+            failures=failures,
+            replan_count=0,
+            perf=perf,
+            task_id=task_id,
+            start_step=0,
+            allowed_tools=allowed_tools,
+        )
+        return {
+            "id": step_id,
+            "title": title,
+            "result": str(result.get("final_response") or "").strip(),
+            "failures": failures,
+            "executed_steps": executed_steps,
+        }
+
+    async def _parallel_execute_groups(
+        self,
+        structured_plan: Dict[str, Any],
+        base_context: List[Dict[str, str]],
+        use_zh: bool,
+        perf: PerfTracer,
+        task_id: str | None,
+    ) -> List[Dict[str, Any]]:
+        groups = structured_plan.get("parallel_groups") or []
+        steps = structured_plan.get("steps") or []
+        if not isinstance(groups, list) or not groups or not isinstance(steps, list):
+            return []
+
+        allow = {
+            "read_file",
+            "find_file",
+            "web_search",
+            "find_skills",
+            "list_local_skills",
+            "find_local_skills",
+            "calculator",
+            "get_current_time",
+            "recall",
+        }
+
+        id_to_step = {}
+        for s in steps:
+            if not isinstance(s, dict):
+                continue
+            sid = s.get("id")
+            if isinstance(sid, int):
+                id_to_step[sid] = s
+
+        artifacts: List[Dict[str, Any]] = []
+        for g in groups[:3]:
+            if not isinstance(g, dict):
+                continue
+            step_ids = g.get("step_ids") if isinstance(g.get("step_ids"), list) else []
+            subtasks = []
+            for sid in step_ids:
+                if isinstance(sid, int) and sid in id_to_step:
+                    subtasks.append(id_to_step[sid])
+            if not subtasks:
+                continue
+
+            ts = time.perf_counter()
+            results = await asyncio.gather(
+                *[
+                    asyncio.wait_for(
+                        self._run_worker_subtask(s, base_context, use_zh, allow, perf, task_id),
+                        timeout=45,
+                    )
+                    for s in subtasks[:4]
+                ],
+                return_exceptions=True,
+            )
+            perf.mark("parallel_group_exec", (time.perf_counter() - ts) * 1000.0)
+            for r in results:
+                if isinstance(r, Exception):
+                    continue
+                artifacts.append(r)
+
+        return artifacts
+
     async def _react_loop(
         self,
         current_turn_messages: List[Dict[str, str]],
@@ -305,6 +458,7 @@ class Agent:
         perf: PerfTracer,
         task_id: str | None,
         start_step: int = 0,
+        allowed_tools: set[str] | None = None,
     ) -> Dict[str, Any]:
         step = start_step
         final_response = ""
@@ -329,6 +483,15 @@ class Agent:
                 tool_args_str = tool_match.group(2).strip()
 
                 try:
+                    if allowed_tools is not None and tool_name not in allowed_tools:
+                        observation = f"Error: Tool not allowed: {tool_name}"
+                        failures.append(f"{tool_name}: {_truncate(observation, 180)}")
+                        perf.incr("tool_failures", 1)
+                        current_turn_messages.append({"role": "assistant", "content": response_text})
+                        current_turn_messages.append({"role": "user", "content": f"Observation: {observation}"})
+                        step += 1
+                        continue
+
                     try:
                         tool_args = json.loads(tool_args_str)
                     except json.JSONDecodeError:
@@ -658,6 +821,11 @@ class Agent:
                 status = str(cp.get("status") or "unknown")
                 step = cp.get("step")
                 running = is_task_running(tid)
+                artifacts_n = 0
+                try:
+                    artifacts_n = len(cp.get("artifacts") or [])
+                except Exception:
+                    artifacts_n = 0
                 last_tool = ""
                 try:
                     xs = cp.get("executed_steps") or []
@@ -665,7 +833,12 @@ class Agent:
                         last_tool = str(xs[-1].get("tool") or "")
                 except Exception:
                     last_tool = ""
-                parts = [f"任务ID：{tid}", f"状态：{status}" + ("（运行中）" if running else ""), f"步骤：{step if step is not None else '-'}"]
+                parts = [
+                    f"任务ID：{tid}",
+                    f"状态：{status}" + ("（运行中）" if running else ""),
+                    f"步骤：{step if step is not None else '-'}",
+                    f"产物数：{artifacts_n}",
+                ]
                 if last_tool:
                     parts.append(f"最近工具：{last_tool}")
                 return "\n".join(parts)
@@ -763,6 +936,7 @@ class Agent:
 
         use_zh = _is_chinese(user_message)
         task_id = forced_task_id or (self._new_task_id() if structured_plan else None)
+        artifacts: List[Dict[str, Any]] = []
 
         if task_id and forced_task_id:
             try:
@@ -803,8 +977,41 @@ class Agent:
                     "executed_steps": executed_steps,
                     "failures": failures,
                     "replan_count": replan_count,
+                    "artifacts": artifacts,
                 },
             )
+
+        if structured_plan and task_id:
+            try:
+                artifacts = await self._parallel_execute_groups(
+                    structured_plan=structured_plan,
+                    base_context=ltm_context + vector_context + stm_context,
+                    use_zh=use_zh,
+                    perf=perf,
+                    task_id=task_id,
+                )
+            except Exception:
+                artifacts = []
+
+            if artifacts:
+                if use_zh:
+                    lines = ["并行执行产物（自动生成）："]
+                    for a in artifacts[:8]:
+                        title = str(a.get("title") or "").strip()
+                        rid = a.get("id")
+                        res = str(a.get("result") or "").strip()
+                        lines.append(f"- [{rid}] {title}: {res[:200]}")
+                    current_turn_messages.append({"role": "user", "content": "\n".join(lines)})
+                else:
+                    lines = ["Parallel Artifacts (Auto):"]
+                    for a in artifacts[:8]:
+                        title = str(a.get("title") or "").strip()
+                        rid = a.get("id")
+                        res = str(a.get("result") or "").strip()
+                        lines.append(f"- [{rid}] {title}: {res[:200]}")
+                    current_turn_messages.append({"role": "user", "content": "\n".join(lines)})
+
+                self._save_checkpoint(task_id, {"status": "running", "artifacts": artifacts, "current_turn_messages": current_turn_messages})
 
         pause_req = ("暂停" in user_message) or ("pause" in user_message.lower())
         if pause_req and task_id:
@@ -822,6 +1029,7 @@ class Agent:
                     "executed_steps": executed_steps,
                     "failures": failures,
                     "replan_count": replan_count,
+                    "artifacts": artifacts,
                 },
             )
             if use_zh:

@@ -28,10 +28,15 @@ def format_plan(plan: dict) -> str:
     if not isinstance(steps, list) or not steps:
         return ""
     lang_is_zh = _has_cjk(" ".join([str(s.get("title") or "") for s in steps if isinstance(s, dict)]))
+
     lines = []
+    id_to_number = {}
     for i, step in enumerate(steps, start=1):
         if not isinstance(step, dict):
             continue
+        sid = step.get("id")
+        if isinstance(sid, int):
+            id_to_number[sid] = i
         title = str(step.get("title") or "").strip()
         details = str(step.get("details") or "").strip()
         success = str(step.get("success") or "").strip()
@@ -42,6 +47,24 @@ def format_plan(plan: dict) -> str:
         if success:
             label = "验收" if lang_is_zh else "Success"
             lines.append(f"   - {label}: {success}")
+
+    groups = plan.get("parallel_groups") or []
+    if isinstance(groups, list) and groups:
+        lines.append("")
+        lines.append("并行任务组：" if lang_is_zh else "Parallel Groups:")
+        for g in groups:
+            if not isinstance(g, dict):
+                continue
+            title = str(g.get("title") or "").strip()
+            step_ids = g.get("step_ids") if isinstance(g.get("step_ids"), list) else []
+            nums = []
+            for sid in step_ids:
+                if isinstance(sid, int) and sid in id_to_number:
+                    nums.append(str(id_to_number[sid]))
+            if not nums:
+                continue
+            header = f"- {title}" if title else "- (group)"
+            lines.append(f"{header}: " + ", ".join(nums))
     return "\n".join(lines).strip()
 
 
@@ -87,6 +110,7 @@ class Planner:
                     "Rules:\n"
                     "- If the task is simple (can be done in 1 step or tool call), set {\"simple\": true}.\n"
                     "- Otherwise set {\"simple\": false} and provide steps.\n"
+                    "- Add parallel_groups when some steps can be done concurrently (optional).\n"
                     "- Each step must be actionable.\n"
                     "- Do not include any text outside JSON.\n\n"
                     "JSON Schema:\n"
@@ -95,10 +119,18 @@ class Planner:
                     "  \"goal\": string,\n"
                     "  \"steps\": [\n"
                     "    {\n"
+                    "      \"id\": number,\n"
                     "      \"title\": string,\n"
                     "      \"details\": string,\n"
                     "      \"success\": string,\n"
                     "      \"tool_hints\": [string]\n"
+                    "    }\n"
+                    "  ]\n"
+                    "  ,\"parallel_groups\": [\n"
+                    "    {\n"
+                    "      \"id\": number,\n"
+                    "      \"title\": string,\n"
+                    "      \"step_ids\": [number]\n"
                     "    }\n"
                     "  ]\n"
                     "}\n"
@@ -117,15 +149,30 @@ class Planner:
         if not isinstance(steps, list):
             steps = []
         normalized_steps = []
-        for step in steps[:20]:
+        for idx, step in enumerate(steps[:20], start=1):
             if not isinstance(step, dict):
                 continue
             normalized_steps.append(
                 {
+                    "id": int(step.get("id") or idx),
                     "title": str(step.get("title") or "").strip(),
                     "details": str(step.get("details") or "").strip(),
                     "success": str(step.get("success") or "").strip(),
                     "tool_hints": step.get("tool_hints") if isinstance(step.get("tool_hints"), list) else [],
                 }
             )
-        return {"simple": simple, "goal": goal, "steps": normalized_steps}
+        groups = data.get("parallel_groups") or []
+        normalized_groups = []
+        if isinstance(groups, list):
+            for gidx, g in enumerate(groups[:8], start=1):
+                if not isinstance(g, dict):
+                    continue
+                step_ids = g.get("step_ids") if isinstance(g.get("step_ids"), list) else []
+                normalized_groups.append(
+                    {
+                        "id": int(g.get("id") or gidx),
+                        "title": str(g.get("title") or "").strip(),
+                        "step_ids": [int(x) for x in step_ids if isinstance(x, int) or (isinstance(x, str) and str(x).isdigit())],
+                    }
+                )
+        return {"simple": simple, "goal": goal, "steps": normalized_steps, "parallel_groups": normalized_groups}
