@@ -18,6 +18,7 @@ from .modules.daily_journal import daily_journal
 from .memory.vector_memory import vector_memory
 from .modules.perf import PerfTracer, perf_include_in_response
 from .modules.checkpoint_store import save_checkpoint, load_checkpoint, latest_task_id
+from .modules.task_runtime import register as register_runtime_task, cancel as cancel_runtime_task, is_running as is_task_running
 from .ui import ui
 
 
@@ -147,6 +148,30 @@ def _parse_resume_task_id(user_message: str) -> str | None:
     v = m.group(1)
     if v:
         return v.lower()
+    return None
+
+
+def _parse_control_command(user_message: str) -> Dict[str, str] | None:
+    text = (user_message or "").strip()
+    if not text:
+        return None
+
+    m = re.match(r"^(?:status|状态)\b\s*([a-f0-9]{8,64})?\s*$", text, re.IGNORECASE)
+    if m:
+        return {"cmd": "status", "task_id": (m.group(1) or "").lower()}
+
+    m = re.match(r"^(?:pause|暂停)\b\s*([a-f0-9]{8,64})?\s*$", text, re.IGNORECASE)
+    if m:
+        return {"cmd": "pause", "task_id": (m.group(1) or "").lower()}
+
+    m = re.match(r"^(?:cancel|取消)\b\s*([a-f0-9]{8,64})?\s*$", text, re.IGNORECASE)
+    if m:
+        return {"cmd": "cancel", "task_id": (m.group(1) or "").lower()}
+
+    m = re.match(r"^(?:bg|后台)\b[:：]?\s+(.+)$", text, re.IGNORECASE | re.DOTALL)
+    if m:
+        return {"cmd": "bg", "message": m.group(1).strip()}
+
     return None
 
 class Agent:
@@ -284,6 +309,14 @@ class Agent:
         step = start_step
         final_response = ""
         while step < self.max_steps:
+            if task_id:
+                try:
+                    st = (load_checkpoint(task_id) or {}).get("status")
+                    if st in {"paused", "canceled", "cancelled"}:
+                        final_response = "已暂停。" if st == "paused" else "已取消。"
+                        break
+                except Exception:
+                    pass
             ui.log_event("LLM", f"Step {step+1}", "Thinking...")
             ts = time.perf_counter()
             response_text = await llm_client.chat(current_turn_messages)
@@ -593,7 +626,7 @@ class Agent:
         self._save_checkpoint(task_id, {"status": "completed", "final_response": final})
         return final
 
-    async def process_message(self, user_message: str) -> str:
+    async def process_message(self, user_message: str, forced_task_id: str | None = None, background: bool = False) -> str:
         """Process a user message through the full cognitive pipeline."""
         perf = PerfTracer()
         t0 = time.perf_counter()
@@ -604,6 +637,49 @@ class Agent:
         if not safe_ok:
             ui.log_event("SAFETY", "Input Blocked", "Dangerous command detected.")
             return "I cannot process this request due to safety restrictions."
+
+        ctrl = _parse_control_command(user_message)
+        if ctrl:
+            cmd = ctrl.get("cmd")
+            tid = ctrl.get("task_id") or (latest_task_id() or "")
+            if cmd == "bg":
+                msg = (ctrl.get("message") or "").strip()
+                if not msg:
+                    return "用法：后台 <要执行的任务>"
+                task_id = self._new_task_id()
+                self._save_checkpoint(task_id, {"status": "queued", "original_user_message": msg, "step": 0})
+                t = asyncio.create_task(self.process_message(msg, forced_task_id=task_id, background=True))
+                register_runtime_task(task_id, t)
+                return f"已在后台启动任务。任务ID：{task_id}\n- 查看：状态 {task_id}\n- 暂停：暂停 {task_id}\n- 取消：取消 {task_id}\n- 恢复：继续 {task_id}"
+            if not tid:
+                return "没有可用的任务ID。"
+            if cmd == "status":
+                cp = load_checkpoint(tid) or {}
+                status = str(cp.get("status") or "unknown")
+                step = cp.get("step")
+                running = is_task_running(tid)
+                last_tool = ""
+                try:
+                    xs = cp.get("executed_steps") or []
+                    if xs:
+                        last_tool = str(xs[-1].get("tool") or "")
+                except Exception:
+                    last_tool = ""
+                parts = [f"任务ID：{tid}", f"状态：{status}" + ("（运行中）" if running else ""), f"步骤：{step if step is not None else '-'}"]
+                if last_tool:
+                    parts.append(f"最近工具：{last_tool}")
+                return "\n".join(parts)
+            if cmd == "pause":
+                cp = load_checkpoint(tid) or {"original_user_message": ""}
+                cp["status"] = "paused"
+                save_checkpoint(tid, cp)
+                return f"已请求暂停。任务ID：{tid}"
+            if cmd == "cancel":
+                cp = load_checkpoint(tid) or {"original_user_message": ""}
+                cp["status"] = "canceled"
+                save_checkpoint(tid, cp)
+                cancel_runtime_task(tid)
+                return f"已请求取消。任务ID：{tid}"
 
         if re.match(r"^(?:resume|继续|恢复)\b", (user_message or "").strip(), re.IGNORECASE):
             tid = _parse_resume_task_id(user_message) or (latest_task_id() or "")
@@ -686,7 +762,16 @@ class Agent:
         replan_count = 0
 
         use_zh = _is_chinese(user_message)
-        task_id = self._new_task_id() if structured_plan else None
+        task_id = forced_task_id or (self._new_task_id() if structured_plan else None)
+
+        if task_id and forced_task_id:
+            try:
+                existing = load_checkpoint(task_id) or {}
+                st = str(existing.get("status") or "").lower()
+                if st in {"paused", "canceled", "cancelled"}:
+                    return "已暂停。" if st == "paused" else "已取消。"
+            except Exception:
+                pass
 
         if structured_plan:
             notes = await self._parallel_agent_notes(
