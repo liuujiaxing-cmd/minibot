@@ -4,6 +4,7 @@ import ast
 import asyncio
 import os
 import time
+import uuid
 from typing import List, Dict, Any
 from .llm import llm_client
 from .tools import get_tools_description, execute_tool, tools_registry, load_plugins
@@ -16,6 +17,7 @@ from .modules.memory_manager import MemoryManager
 from .modules.daily_journal import daily_journal
 from .memory.vector_memory import vector_memory
 from .modules.perf import PerfTracer, perf_include_in_response
+from .modules.checkpoint_store import save_checkpoint, load_checkpoint, latest_task_id
 from .ui import ui
 
 
@@ -134,6 +136,19 @@ def _should_decompose(user_message: str) -> bool:
 
     return False
 
+
+def _parse_resume_task_id(user_message: str) -> str | None:
+    text = (user_message or "").strip()
+    if not text:
+        return None
+    m = re.match(r"^(?:resume|继续|恢复)\b\s*([a-f0-9]{8,64})?\s*$", text, re.IGNORECASE)
+    if not m:
+        return None
+    v = m.group(1)
+    if v:
+        return v.lower()
+    return None
+
 class Agent:
     """Core agent logic handling the ReAct loop."""
     
@@ -189,108 +204,97 @@ class Agent:
                 "   - BE AUTONOMOUS. Do not ask for permission to learn. Just do it."
             )
 
-    async def process_message(self, user_message: str) -> str:
-        """Process a user message through the full cognitive pipeline."""
-        perf = PerfTracer()
-        t0 = time.perf_counter()
-        
-        ts = time.perf_counter()
-        safe_ok = self.safety.check_input(user_message)
-        perf.mark("safety_check_input", (time.perf_counter() - ts) * 1000.0)
-        if not safe_ok:
-            ui.log_event("SAFETY", "Input Blocked", "Dangerous command detected.")
-            return "I cannot process this request due to safety restrictions."
+    def _new_task_id(self) -> str:
+        return uuid.uuid4().hex
 
-        ts = time.perf_counter()
-        self.short_term_memory.add("user", user_message)
-        perf.mark("stm_add_user", (time.perf_counter() - ts) * 1000.0)
-
-        ts = time.perf_counter()
+    def _save_checkpoint(self, task_id: str, payload: Dict[str, Any]) -> None:
         try:
-            if daily_journal:
-                daily_journal.append_turn("用户", user_message)
+            save_checkpoint(task_id, payload)
         except Exception:
             pass
-        perf.mark("daily_journal_append_user", (time.perf_counter() - ts) * 1000.0)
 
-        ts = time.perf_counter()
-        try:
-            if vector_memory:
-                asyncio.create_task(vector_memory.add("user", user_message, {"type": "turn"}))
-        except Exception:
-            pass
-        perf.mark("vector_add_user_scheduled", (time.perf_counter() - ts) * 1000.0)
-        
-        ui.log_event("MEMORY", "Context Retrieved", "Loading STM & LTM...")
-        ts = time.perf_counter()
-        ltm_context = self.long_term_memory.get_context()
-        perf.mark("ltm_get_context", (time.perf_counter() - ts) * 1000.0)
-        vector_context = []
-        try:
-            if vector_memory:
-                ts = time.perf_counter()
-                vector_context = await vector_memory.get_context(user_message, top_k=5)
-                perf.mark("vector_get_context", (time.perf_counter() - ts) * 1000.0)
-        except Exception:
-            vector_context = []
-        ts = time.perf_counter()
-        stm_context = self.short_term_memory.get_context()
-        perf.mark("stm_get_context", (time.perf_counter() - ts) * 1000.0)
-        
-        user_name = self.long_term_memory.get("user_name")
-        user_profile = {"user_name": user_name} if user_name else {}
-        
-        style_instruction = self.personality.get_style_prompt(user_profile)
-        
-        plan = "Standard Execution"
-        decomposed_plan = None
-        structured_plan = None
-        if _should_decompose(user_message):
-             ui.log_event("PLAN", "Decomposing Task", "Generating step-by-step plan...")
-             ts = time.perf_counter()
-             sp = await self.planner.decompose_structured(user_message)
-             perf.mark("planner_decompose_structured", (time.perf_counter() - ts) * 1000.0)
-             if sp and not sp.get("simple", False):
-                 structured_plan = sp
-                 decomposed_plan = format_plan(sp)
-                 if decomposed_plan:
-                     plan = f"Follow these steps:\n{decomposed_plan}"
-                     ui.log_event("PLAN", "Plan Created", decomposed_plan[:50] + "...")
-        
-        ts = time.perf_counter()
-        tools_desc = get_tools_description()
-        current_system_prompt = self.system_prompt_template.format(
-            style_instruction=style_instruction,
-            tools_desc=tools_desc,
-            plan=plan
+    async def _parallel_agent_notes(self, base_messages: List[Dict[str, str]], user_message: str, plan_text: str, use_zh: bool, perf: PerfTracer) -> Dict[str, str]:
+        system_common = (
+            "You must not call tools. You must not claim to have created files, executed commands, or verified results.\n"
+            "Return only actionable notes, assumptions, and risks. Keep it concise.\n"
         )
-        perf.mark("prompt_build", (time.perf_counter() - ts) * 1000.0)
-        
-        messages = [{"role": "system", "content": current_system_prompt}]
-        messages.extend(ltm_context)
-        messages.extend(vector_context)
-        messages.extend(stm_context)
-        
-        step = 0
+        if use_zh:
+            system_common = (
+                "你不得调用任何工具。你不得宣称已创建文件、已执行命令或已验证结果。\n"
+                "只输出可执行的要点、假设与风险，保持简洁。\n"
+            )
+
+        researcher_system = (
+            "Role: Researcher.\n"
+            + system_common
+            + "Focus: gather needed info, propose parallel subtasks, list what to check.\n"
+        )
+        reviewer_system = (
+            "Role: Reviewer.\n"
+            + system_common
+            + "Focus: detect missing steps, contradictions, unsafe claims, and acceptance criteria.\n"
+        )
+        if use_zh:
+            researcher_system = (
+                "角色：Researcher（信息收集）。\n"
+                + system_common
+                + "重点：需要补充的信息、可并行的子任务、要验证的点。\n"
+            )
+            reviewer_system = (
+                "角色：Reviewer（复核）。\n"
+                + system_common
+                + "重点：缺失步骤、矛盾点、可能的虚假完成宣称、验收标准。\n"
+            )
+
+        payload = f"User request:\n{user_message}\n\nPlan:\n{plan_text}".strip()
+        r_msgs = [{"role": "system", "content": researcher_system}] + base_messages + [{"role": "user", "content": payload}]
+        v_msgs = [{"role": "system", "content": reviewer_system}] + base_messages + [{"role": "user", "content": payload}]
+
+        async def _call(msgs: List[Dict[str, str]]):
+            return await llm_client.chat(msgs)
+
+        ts = time.perf_counter()
+        try:
+            res, rev = await asyncio.gather(
+                asyncio.wait_for(_call(r_msgs), timeout=20),
+                asyncio.wait_for(_call(v_msgs), timeout=20),
+            )
+            perf.mark("parallel_agents", (time.perf_counter() - ts) * 1000.0)
+            return {"researcher": str(res).strip(), "reviewer": str(rev).strip()}
+        except Exception:
+            perf.mark("parallel_agents", (time.perf_counter() - ts) * 1000.0)
+            return {}
+
+    async def _react_loop(
+        self,
+        current_turn_messages: List[Dict[str, str]],
+        user_message: str,
+        style_instruction: str,
+        tools_desc: str,
+        plan: str,
+        structured_plan: Dict[str, Any] | None,
+        decomposed_plan: str | None,
+        executed_steps: List[Dict[str, Any]],
+        failures: List[str],
+        replan_count: int,
+        perf: PerfTracer,
+        task_id: str | None,
+        start_step: int = 0,
+    ) -> Dict[str, Any]:
+        step = start_step
         final_response = ""
-        current_turn_messages = list(messages)
-        executed_steps = []
-        failures = []
-        replan_count = 0
-        
         while step < self.max_steps:
             ui.log_event("LLM", f"Step {step+1}", "Thinking...")
             ts = time.perf_counter()
             response_text = await llm_client.chat(current_turn_messages)
             perf.mark("llm_chat", (time.perf_counter() - ts) * 1000.0, {"step": step + 1})
             perf.incr("llm_calls", 1)
-            
+
             tool_match = re.search(r"Action:\s*(\w+)\s*Action Input:\s*(.*?)(?:\nObservation:|$)", response_text, re.DOTALL)
-            
             if tool_match:
                 tool_name = tool_match.group(1).strip()
                 tool_args_str = tool_match.group(2).strip()
-                
+
                 try:
                     try:
                         tool_args = json.loads(tool_args_str)
@@ -300,19 +304,18 @@ class Agent:
                         except (ValueError, SyntaxError):
                             if tool_args_str.startswith("{") or tool_args_str.startswith("["):
                                 raise ValueError("Invalid JSON/Dict format")
-                            tool_args = {"arg": tool_args_str} 
-                        
+                            tool_args = {"arg": tool_args_str}
+
                     ui.log_event("TOOL", f"Executing {tool_name}", str(tool_args))
-                    
                     ts = time.perf_counter()
                     if isinstance(tool_args, dict):
                         observation = execute_tool(tool_name, **tool_args)
                     else:
-                         observation = execute_tool(tool_name, tool_args)
+                        observation = execute_tool(tool_name, tool_args)
                     tool_ms = (time.perf_counter() - ts) * 1000.0
                     perf.mark("tool_exec", tool_ms, {"tool": tool_name})
                     perf.incr("tool_calls", 1)
-                    
+
                     obs_preview = str(observation)[:100] + "..." if len(str(observation)) > 100 else str(observation)
                     ui.log_event("TOOL", "Observation", obs_preview)
                     ok = not _looks_like_failure(observation)
@@ -339,6 +342,7 @@ class Agent:
                     if not ok:
                         failures.append(f"{tool_name}: {_truncate(observation, 180)}")
                         perf.incr("tool_failures", 1)
+
                     if structured_plan and len(failures) >= 3 and replan_count < 1:
                         replan_count += 1
                         ui.log_event("PLAN", "Replanning", _truncate("\n".join(failures[-3:]), 160))
@@ -363,22 +367,62 @@ class Agent:
                 except Exception as e:
                     observation = f"Error parsing/executing tool: {str(e)}"
                     ui.log_event("ERROR", "Tool Execution Failed", str(e))
-                
+
                 current_turn_messages.append({"role": "assistant", "content": response_text})
-                
                 current_turn_messages.append({"role": "user", "content": f"Observation: {observation}"})
                 step += 1
+
+                if task_id:
+                    self._save_checkpoint(
+                        task_id,
+                        {
+                            "status": "running",
+                            "original_user_message": user_message,
+                            "current_turn_messages": current_turn_messages,
+                            "step": step,
+                            "plan": plan,
+                            "decomposed_plan": decomposed_plan,
+                            "structured_plan": structured_plan,
+                            "executed_steps": executed_steps,
+                            "failures": failures,
+                            "replan_count": replan_count,
+                        },
+                    )
             else:
                 final_response = response_text
-                self.short_term_memory.add("assistant", final_response)
                 break
-        
-        if not final_response:
-             final_response = "I apologize, but I ran out of steps to complete your request."
-        
+
+        return {
+            "final_response": final_response,
+            "step": step,
+            "executed_steps": executed_steps,
+            "failures": failures,
+            "replan_count": replan_count,
+            "plan": plan,
+            "decomposed_plan": decomposed_plan,
+            "structured_plan": structured_plan,
+            "current_turn_messages": current_turn_messages,
+        }
+
+    async def _finalize_turn(
+        self,
+        user_message: str,
+        core_response: str,
+        plan: str,
+        decomposed_plan: str | None,
+        structured_plan: Dict[str, Any] | None,
+        executed_steps: List[Dict[str, Any]],
+        failures: List[str],
+        perf: PerfTracer,
+        t0: float,
+        step: int,
+        replan_count: int,
+    ) -> str:
+        if not core_response:
+            core_response = "I apologize, but I ran out of steps to complete your request."
+
         use_zh = _is_chinese(user_message)
-        final_response = self.safety.sanitize_output(final_response)
-        core_response = final_response
+        core_response = self.safety.sanitize_output(core_response)
         if _needs_audit_disclaimer(core_response, executed_steps):
             if use_zh:
                 core_response = "注意：我在这轮对话里没有执行任何工具/命令，也没有对文件系统做修改；下面内容是建议或计划，并非已落地结果。\n\n" + core_response
@@ -462,7 +506,7 @@ class Agent:
         if plan_prefix:
             prefix_parts.append(plan_prefix)
         final_response = "\n\n".join(prefix_parts) + "\n\n" + core_response
-        
+
         asyncio.create_task(self.memory_manager.auto_extract(user_message, final_response))
 
         try:
@@ -489,7 +533,248 @@ class Agent:
                 asyncio.create_task(vector_memory.add("assistant", core, {"type": "turn"}))
         except Exception:
             pass
-        
+
+        self.short_term_memory.add("assistant", final_response)
         return final_response
+
+    async def _resume_from_checkpoint(self, task_id: str, perf: PerfTracer, t0: float) -> str:
+        cp = load_checkpoint(task_id)
+        if not cp:
+            return f"找不到任务 {task_id} 的检查点。"
+
+        original_user_message = str(cp.get("original_user_message") or "")
+        current_turn_messages = cp.get("current_turn_messages") or []
+        if not isinstance(current_turn_messages, list) or not current_turn_messages:
+            return "检查点数据不完整，无法恢复。" if _is_chinese(original_user_message) else "Checkpoint is incomplete; cannot resume."
+
+        executed_steps = cp.get("executed_steps") or []
+        failures = cp.get("failures") or []
+        replan_count = int(cp.get("replan_count") or 0)
+        step = int(cp.get("step") or 0)
+        plan = str(cp.get("plan") or "Standard Execution")
+        decomposed_plan = cp.get("decomposed_plan")
+        structured_plan = cp.get("structured_plan")
+
+        use_zh = _is_chinese(original_user_message) or _is_chinese(str(cp.get("use_zh") or ""))
+        user_name = self.long_term_memory.get("user_name")
+        user_profile = {"user_name": user_name} if user_name else {}
+        style_instruction = self.personality.get_style_prompt(user_profile)
+        tools_desc = get_tools_description()
+
+        result = await self._react_loop(
+            current_turn_messages=current_turn_messages,
+            user_message=original_user_message,
+            style_instruction=style_instruction,
+            tools_desc=tools_desc,
+            plan=plan,
+            structured_plan=structured_plan,
+            decomposed_plan=decomposed_plan,
+            executed_steps=executed_steps,
+            failures=failures,
+            replan_count=replan_count,
+            perf=perf,
+            task_id=task_id,
+            start_step=step,
+        )
+
+        final = await self._finalize_turn(
+            user_message=original_user_message,
+            core_response=str(result.get("final_response") or ""),
+            plan=str(result.get("plan") or plan),
+            decomposed_plan=result.get("decomposed_plan"),
+            structured_plan=result.get("structured_plan"),
+            executed_steps=result.get("executed_steps") or [],
+            failures=result.get("failures") or [],
+            perf=perf,
+            t0=t0,
+            step=int(result.get("step") or 0),
+            replan_count=int(result.get("replan_count") or 0),
+        )
+        self._save_checkpoint(task_id, {"status": "completed", "final_response": final})
+        return final
+
+    async def process_message(self, user_message: str) -> str:
+        """Process a user message through the full cognitive pipeline."""
+        perf = PerfTracer()
+        t0 = time.perf_counter()
+        
+        ts = time.perf_counter()
+        safe_ok = self.safety.check_input(user_message)
+        perf.mark("safety_check_input", (time.perf_counter() - ts) * 1000.0)
+        if not safe_ok:
+            ui.log_event("SAFETY", "Input Blocked", "Dangerous command detected.")
+            return "I cannot process this request due to safety restrictions."
+
+        if re.match(r"^(?:resume|继续|恢复)\b", (user_message or "").strip(), re.IGNORECASE):
+            tid = _parse_resume_task_id(user_message) or (latest_task_id() or "")
+            if not tid:
+                return "没有可恢复的任务检查点。"
+            return await self._resume_from_checkpoint(tid, perf, t0)
+
+        ts = time.perf_counter()
+        self.short_term_memory.add("user", user_message)
+        perf.mark("stm_add_user", (time.perf_counter() - ts) * 1000.0)
+
+        ts = time.perf_counter()
+        try:
+            if daily_journal:
+                daily_journal.append_turn("用户", user_message)
+        except Exception:
+            pass
+        perf.mark("daily_journal_append_user", (time.perf_counter() - ts) * 1000.0)
+
+        ts = time.perf_counter()
+        try:
+            if vector_memory:
+                asyncio.create_task(vector_memory.add("user", user_message, {"type": "turn"}))
+        except Exception:
+            pass
+        perf.mark("vector_add_user_scheduled", (time.perf_counter() - ts) * 1000.0)
+        
+        ui.log_event("MEMORY", "Context Retrieved", "Loading STM & LTM...")
+        ts = time.perf_counter()
+        ltm_context = self.long_term_memory.get_context()
+        perf.mark("ltm_get_context", (time.perf_counter() - ts) * 1000.0)
+        vector_context = []
+        try:
+            if vector_memory:
+                ts = time.perf_counter()
+                vector_context = await vector_memory.get_context(user_message, top_k=5)
+                perf.mark("vector_get_context", (time.perf_counter() - ts) * 1000.0)
+        except Exception:
+            vector_context = []
+        ts = time.perf_counter()
+        stm_context = self.short_term_memory.get_context()
+        perf.mark("stm_get_context", (time.perf_counter() - ts) * 1000.0)
+        
+        user_name = self.long_term_memory.get("user_name")
+        user_profile = {"user_name": user_name} if user_name else {}
+        
+        style_instruction = self.personality.get_style_prompt(user_profile)
+        
+        plan = "Standard Execution"
+        decomposed_plan = None
+        structured_plan = None
+        if _should_decompose(user_message):
+             ui.log_event("PLAN", "Decomposing Task", "Generating step-by-step plan...")
+             ts = time.perf_counter()
+             sp = await self.planner.decompose_structured(user_message)
+             perf.mark("planner_decompose_structured", (time.perf_counter() - ts) * 1000.0)
+             if sp and not sp.get("simple", False):
+                 structured_plan = sp
+                 decomposed_plan = format_plan(sp)
+                 if decomposed_plan:
+                     plan = f"Follow these steps:\n{decomposed_plan}"
+                     ui.log_event("PLAN", "Plan Created", decomposed_plan[:50] + "...")
+        
+        ts = time.perf_counter()
+        tools_desc = get_tools_description()
+        current_system_prompt = self.system_prompt_template.format(
+            style_instruction=style_instruction,
+            tools_desc=tools_desc,
+            plan=plan
+        )
+        perf.mark("prompt_build", (time.perf_counter() - ts) * 1000.0)
+        
+        messages = [{"role": "system", "content": current_system_prompt}]
+        messages.extend(ltm_context)
+        messages.extend(vector_context)
+        messages.extend(stm_context)
+        current_turn_messages = list(messages)
+        executed_steps: List[Dict[str, Any]] = []
+        failures: List[str] = []
+        replan_count = 0
+
+        use_zh = _is_chinese(user_message)
+        task_id = self._new_task_id() if structured_plan else None
+
+        if structured_plan:
+            notes = await self._parallel_agent_notes(
+                base_messages=ltm_context + vector_context + stm_context,
+                user_message=user_message,
+                plan_text=plan,
+                use_zh=use_zh,
+                perf=perf,
+            )
+            if notes:
+                if use_zh:
+                    block = "并行代理要点：\n\n" + "Researcher：\n" + notes.get("researcher", "").strip() + "\n\nReviewer：\n" + notes.get("reviewer", "").strip()
+                else:
+                    block = "Parallel Agent Notes:\n\nResearcher:\n" + notes.get("researcher", "").strip() + "\n\nReviewer:\n" + notes.get("reviewer", "").strip()
+                current_turn_messages.append({"role": "user", "content": block})
+
+        if task_id:
+            self._save_checkpoint(
+                task_id,
+                {
+                    "status": "running",
+                    "use_zh": use_zh,
+                    "original_user_message": user_message,
+                    "current_turn_messages": current_turn_messages,
+                    "step": 0,
+                    "plan": plan,
+                    "decomposed_plan": decomposed_plan,
+                    "structured_plan": structured_plan,
+                    "executed_steps": executed_steps,
+                    "failures": failures,
+                    "replan_count": replan_count,
+                },
+            )
+
+        pause_req = ("暂停" in user_message) or ("pause" in user_message.lower())
+        if pause_req and task_id:
+            self._save_checkpoint(
+                task_id,
+                {
+                    "status": "paused",
+                    "use_zh": use_zh,
+                    "original_user_message": user_message,
+                    "current_turn_messages": current_turn_messages,
+                    "step": 0,
+                    "plan": plan,
+                    "decomposed_plan": decomposed_plan,
+                    "structured_plan": structured_plan,
+                    "executed_steps": executed_steps,
+                    "failures": failures,
+                    "replan_count": replan_count,
+                },
+            )
+            if use_zh:
+                return f"已暂停并保存检查点。任务ID：{task_id}\n发送：继续 {task_id} 来恢复执行。"
+            return f"Paused. Task ID: {task_id}\nSend: resume {task_id} to continue."
+
+        result = await self._react_loop(
+            current_turn_messages=current_turn_messages,
+            user_message=user_message,
+            style_instruction=style_instruction,
+            tools_desc=tools_desc,
+            plan=plan,
+            structured_plan=structured_plan,
+            decomposed_plan=decomposed_plan,
+            executed_steps=executed_steps,
+            failures=failures,
+            replan_count=replan_count,
+            perf=perf,
+            task_id=task_id,
+            start_step=0,
+        )
+
+        final = await self._finalize_turn(
+            user_message=user_message,
+            core_response=str(result.get("final_response") or ""),
+            plan=str(result.get("plan") or plan),
+            decomposed_plan=result.get("decomposed_plan"),
+            structured_plan=result.get("structured_plan"),
+            executed_steps=result.get("executed_steps") or [],
+            failures=result.get("failures") or [],
+            perf=perf,
+            t0=t0,
+            step=int(result.get("step") or 0),
+            replan_count=int(result.get("replan_count") or 0),
+        )
+
+        if task_id:
+            self._save_checkpoint(task_id, {"status": "completed", "final_response": final})
+        return final
 
 agent = Agent()
